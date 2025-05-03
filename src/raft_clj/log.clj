@@ -44,10 +44,15 @@
   (number-of-entries log))
 
 
+(defn last-entry
+  [log]
+  (nth log (index-of-last log)))
+
+
 (defn term-of-last-entry
   [log]
   (-> log
-      (nth (index-of-last log))
+      last-entry
       :term))
 
 
@@ -82,6 +87,12 @@
               false
               (recur current-term (rest remaining))))))))
 
+;;; append-entries! has a concurrency bug 
+;;; because there is a small time gap between when an atom is dereffed and the 
+;;; checks for appending happen and when the log actually gets appended. 
+;;; this can be verified by running a test across 5 threads where each thread has a decent likelihood of 
+;;; of committing an entry
+;;; I've also discovered a deadlock. the tests never finish running
 
 (defn append-entries!
   "Implementation of AppendEntries, side-effectful,
@@ -119,6 +130,9 @@
     ;; RAFT paper condition 2 Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
     (not= (:term (get @log prev-index)) prev-term) false
 
+    (and (seq entries)
+         (< (:term (first entries)) (:term (last-entry @log)))) false
+
     :else
     (loop [prev-index' prev-index
            entries' entries]
@@ -130,7 +144,8 @@
               existing-entry (get @log index-to-insert-at)]
           (if-not existing-entry
             ;; simple case
-            (do (swap! log assoc index-to-insert-at entry-to-insert)
+            (do 
+              (swap! log assoc index-to-insert-at entry-to-insert)
                 (recur index-to-insert-at (rest entries')))
             ;; tricky case
             (cond
