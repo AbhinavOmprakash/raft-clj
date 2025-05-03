@@ -87,13 +87,64 @@
               false
               (recur current-term (rest remaining))))))))
 
-;;; append-entries! has a concurrency bug 
-;;; because there is a small time gap between when an atom is dereffed and the 
-;;; checks for appending happen and when the log actually gets appended. 
-;;; this can be verified by running a test across 5 threads where each thread has a decent likelihood of 
-;;; of committing an entry
-;;; I've also discovered a deadlock. the tests never finish running
 
+(defn- append-entries
+  [log prev-index prev-term entries]
+  (cond
+    ;; If prev-index is greater than index-of-last item then that means there are holes in the log
+    (> prev-index (index-of-last log)) log
+
+    ;; RAFT paper condition 2 Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+    (not= (:term (get log prev-index)) prev-term) log
+
+    (and (seq entries)
+         (< (:term (first entries)) (:term (last-entry log)))) log
+
+    :else
+    (loop [log' log
+           prev-index' prev-index
+           entries' entries]
+      ;; append-entries should succeed when leader tries to append empty entries
+      (if (empty? entries')
+        log'
+        (let [index-to-insert-at (inc prev-index')
+              entry-to-insert (first entries')
+              existing-entry (get log index-to-insert-at)]
+          (if-not existing-entry
+            ;; simple case
+            (recur (assoc log' index-to-insert-at entry-to-insert)
+                   index-to-insert-at
+                   (rest entries'))
+            ;; tricky case
+            (cond
+              (= existing-entry entry-to-insert)
+              ;; don't insert or append, continue the looping
+              (recur log
+                     index-to-insert-at
+                     (rest entries'))
+
+              ;; if the term of the existing-entry is less than or equal to the leaders term
+              ;; then the leader's entry is the most up-to-date one so, overwrite the current entry
+              ;; and delete all existing entries that follow it
+              (<= (:term existing-entry) (:term entry-to-insert))
+              (recur (-> log
+                         (subvec 0 index-to-insert-at) ; ; delete existing entries
+                         (assoc index-to-insert-at entry-to-insert)) ; insert new entry
+                     index-to-insert-at (rest entries'))
+
+              ;; if the term of the existing-entry is greater than the leader's term
+              ;; that means the leader is outdated and hence the append should fail
+              ;; this case can happen when there is a network partition and a leader gets separated from the pack and then returns
+              ;; thinking that it is still the leader.
+              :else log')))))))
+
+
+;; append-entries! has a concurrency bug
+;; because there is a small time gap between when an atom is dereffed and the
+;; checks for appending happen and when the log actually gets appended.
+;; this can be verified by running a test across 5 threads where each thread has a decent likelihood of
+;; of committing an entry
+;; I've also discovered a deadlock. the tests never finish running
 (defn append-entries!
   "Implementation of AppendEntries, side-effectful,
   modifies log with `swap!`and returns a boolean
@@ -123,50 +174,8 @@
          ;; but it doesn't hurt to be defensive here
          (monotonically-increasing? :term entries)]
    :post [(boolean? %)]}
-  (cond
-    ;; If prev-index is greater than index-of-last item then that means there are holes in the log
-    (> prev-index (index-of-last @log)) false
-
-    ;; RAFT paper condition 2 Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-    (not= (:term (get @log prev-index)) prev-term) false
-
-    (and (seq entries)
-         (< (:term (first entries)) (:term (last-entry @log)))) false
-
-    :else
-    (loop [prev-index' prev-index
-           entries' entries]
-      ;; append-entries should succeed when leader tries to append empty entries
-      (if (empty? entries')
-        true
-        (let [index-to-insert-at (inc prev-index')
-              entry-to-insert (first entries')
-              existing-entry (get @log index-to-insert-at)]
-          (if-not existing-entry
-            ;; simple case
-            (do 
-              (swap! log assoc index-to-insert-at entry-to-insert)
-                (recur index-to-insert-at (rest entries')))
-            ;; tricky case
-            (cond
-              (= existing-entry entry-to-insert)
-              ;; don't insert or append, continue the looping
-              (do (swap! log assoc index-to-insert-at entry-to-insert)
-                  (recur index-to-insert-at (rest entries')))
-
-              ;; if the term of the existing-entry is less than or equal to the leaders term
-              ;; then the leader's entry is the most up-to-date one so, overwrite the current entry
-              ;; and delete all existing entries that follow it
-              (<= (:term existing-entry) (:term entry-to-insert))
-              (do
-                ;; ; delete existing entries
-                (swap! log subvec 0 index-to-insert-at)
-                ;; insert new entry
-                (swap! log assoc index-to-insert-at entry-to-insert)
-                (recur index-to-insert-at (rest entries')))
-
-              ;; if the term of the existing-entry is greater than the leader's term
-              ;; that means the leader is outdated and hence the append should fail
-              ;; this case can happen when there is a network partition and a leader gets separated from the pack and then returns
-              ;; thinking that it is still the leader.
-              :else false)))))))
+  (let [olog @log
+        updated-log (swap! log append-entries prev-index prev-term entries)]
+    ;; if updated-log is not same as old log then the append must have succeeded
+    (or (empty? entries) ; if entries are empty olog = updated-log so short circuit and return true
+        (not= olog updated-log))))
